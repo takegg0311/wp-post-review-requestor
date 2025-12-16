@@ -70,6 +70,14 @@ class Post_Review_Requestor {
 		
 		// 管理画面のスタイルとスクリプトを読み込む
 		add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_admin_assets' ) );
+		
+		// ユーザープロフィールページに通知設定を追加
+		add_action( 'show_user_profile', array( $this, 'add_user_notification_setting' ) );
+		add_action( 'edit_user_profile', array( $this, 'add_user_notification_setting' ) );
+		
+		// ユーザープロフィール設定を保存
+		add_action( 'personal_options_update', array( $this, 'save_user_notification_setting' ) );
+		add_action( 'edit_user_profile_update', array( $this, 'save_user_notification_setting' ) );
 	}
 	
 	/**
@@ -102,10 +110,10 @@ class Post_Review_Requestor {
 	 * 通知を送信
 	 */
 	private function send_notification( $post ) {
-		// 通知先のメールアドレスを取得（管理者メールアドレス）
-		$admin_email = get_option( 'admin_email' );
+		// 通知を受け取る設定をしている管理者・編集者を取得
+		$recipients = $this->get_notification_recipients();
 		
-		if ( empty( $admin_email ) ) {
+		if ( empty( $recipients ) ) {
 			return;
 		}
 		
@@ -122,21 +130,6 @@ class Post_Review_Requestor {
 			'[%s] レビュー依頼: %s',
 			get_bloginfo( 'name' ),
 			$post_title
-		);
-		
-		// メール本文
-		$message = sprintf(
-			"以下の%sがレビュー待ち状態になりました。\n\n" .
-			"タイトル: %s\n" .
-			"投稿タイプ: %s\n" .
-			"作成者: %s\n" .
-			"編集リンク: %s\n\n" .
-			"レビューをお願いします。",
-			$post_type_label,
-			$post_title,
-			$post_type_label,
-			$author_name,
-			$edit_link
 		);
 		
 		// HTMLメールとして送信
@@ -158,14 +151,46 @@ class Post_Review_Requestor {
 			esc_url( $edit_link )
 		);
 		
+		// 管理者メールアドレスを取得（From用）
+		$admin_email = get_option( 'admin_email' );
+		
 		// メールヘッダー
 		$headers = array(
 			'Content-Type: text/html; charset=UTF-8',
 			'From: ' . get_bloginfo( 'name' ) . ' <' . $admin_email . '>'
 		);
 		
-		// メール送信
-		wp_mail( $admin_email, $subject, $html_message, $headers );
+		// 各受信者にメール送信
+		foreach ( $recipients as $recipient_email ) {
+			wp_mail( $recipient_email, $subject, $html_message, $headers );
+		}
+	}
+	
+	/**
+	 * 通知を受け取る設定をしている管理者・編集者を取得
+	 */
+	private function get_notification_recipients() {
+		$recipients = array();
+		
+		// 管理者・編集者権限を持つユーザーを取得
+		$users = get_users( array(
+			'role__in' => array( 'administrator', 'editor' ),
+		) );
+		
+		foreach ( $users as $user ) {
+			// 通知を受け取る設定をしているかチェック
+			$receive_notifications = get_user_meta( $user->ID, 'prr_receive_notifications', true );
+			
+			if ( $receive_notifications === '1' || $receive_notifications === '' ) {
+				// デフォルトでは有効（既存ユーザーへの後方互換性のため）
+				$user_email = $user->user_email;
+				if ( ! empty( $user_email ) ) {
+					$recipients[] = $user_email;
+				}
+			}
+		}
+		
+		return $recipients;
 	}
 	
 	/**
@@ -337,6 +362,67 @@ class Post_Review_Requestor {
 			array(),
 			PRR_VERSION
 		);
+	}
+	
+	/**
+	 * ユーザープロフィールページに通知設定を追加
+	 */
+	public function add_user_notification_setting( $user ) {
+		// 管理者・編集者権限を持つユーザーのみ表示
+		if ( ! user_can( $user, 'edit_posts' ) ) {
+			return;
+		}
+		
+		$receive_notifications = get_user_meta( $user->ID, 'prr_receive_notifications', true );
+		// デフォルトでは有効（既存ユーザーへの後方互換性のため）
+		$checked = ( $receive_notifications === '1' || $receive_notifications === '' ) ? 'checked' : '';
+		
+		?>
+		<h2>レビュー依頼通知設定</h2>
+		<table class="form-table">
+			<tr>
+				<th scope="row">レビュー依頼通知を受け取る</th>
+				<td>
+					<label for="prr_receive_notifications">
+						<input 
+							type="checkbox" 
+							name="prr_receive_notifications" 
+							id="prr_receive_notifications" 
+							value="1" 
+							<?php echo esc_attr( $checked ); ?>
+						/>
+						投稿・ページが「レビュー待ち」状態になった際に通知メールを受け取る
+					</label>
+					<p class="description">
+						この設定を有効にすると、投稿・カスタム投稿・固定ページが「レビュー待ち」状態になった際に通知メールが送信されます。
+					</p>
+				</td>
+			</tr>
+		</table>
+		<?php
+	}
+	
+	/**
+	 * ユーザープロフィール設定を保存
+	 */
+	public function save_user_notification_setting( $user_id ) {
+		// 権限チェック
+		if ( ! current_user_can( 'edit_user', $user_id ) ) {
+			return;
+		}
+		
+		// 管理者・編集者権限を持つユーザーのみ保存
+		$user = get_userdata( $user_id );
+		if ( ! $user || ! user_can( $user, 'edit_posts' ) ) {
+			return;
+		}
+		
+		// 通知設定を保存
+		if ( isset( $_POST['prr_receive_notifications'] ) && $_POST['prr_receive_notifications'] === '1' ) {
+			update_user_meta( $user_id, 'prr_receive_notifications', '1' );
+		} else {
+			update_user_meta( $user_id, 'prr_receive_notifications', '0' );
+		}
 	}
 }
 
