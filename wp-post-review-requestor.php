@@ -78,6 +78,9 @@ class Post_Review_Requestor {
 		// ユーザープロフィール設定を保存
 		add_action( 'personal_options_update', array( $this, 'save_user_notification_setting' ) );
 		add_action( 'edit_user_profile_update', array( $this, 'save_user_notification_setting' ) );
+		
+		// Cronジョブをスケジュール
+		add_action( 'prr_send_queued_notifications', array( $this, 'send_queued_notifications' ) );
 	}
 	
 	/**
@@ -160,9 +163,31 @@ class Post_Review_Requestor {
 			'From: ' . get_bloginfo( 'name' ) . ' <' . $admin_email . '>'
 		);
 		
-		// 各受信者にメール送信
-		foreach ( $recipients as $recipient_email ) {
-			wp_mail( $recipient_email, $subject, $html_message, $headers );
+		// 現在時刻を取得
+		$current_hour = (int) current_time( 'H' );
+		$current_minute = (int) current_time( 'i' );
+		$current_time_minutes = $current_hour * 60 + $current_minute;
+		
+		// 各受信者にメール送信またはキューに保存
+		foreach ( $recipients as $user_id => $recipient_email ) {
+			$notification_time = $this->get_user_notification_time( $user_id );
+			
+			if ( $notification_time === null ) {
+				// 時間帯制限なし（24時間受信）
+				wp_mail( $recipient_email, $subject, $html_message, $headers );
+			} else {
+				$start_time_minutes = $notification_time['start_hour'] * 60 + $notification_time['start_minute'];
+				$end_time_minutes = $notification_time['end_hour'] * 60 + $notification_time['end_minute'];
+				
+				// 時間帯内かチェック
+				if ( $this->is_time_in_range( $current_time_minutes, $start_time_minutes, $end_time_minutes ) ) {
+					// 時間帯内なので即座に送信
+					wp_mail( $recipient_email, $subject, $html_message, $headers );
+				} else {
+					// 時間帯外なのでキューに保存
+					$this->queue_notification( $user_id, $post->ID, $subject, $html_message, $headers );
+				}
+			}
 		}
 	}
 	
@@ -185,12 +210,142 @@ class Post_Review_Requestor {
 				// デフォルトでは有効（既存ユーザーへの後方互換性のため）
 				$user_email = $user->user_email;
 				if ( ! empty( $user_email ) ) {
-					$recipients[] = $user_email;
+					$recipients[ $user->ID ] = $user_email;
 				}
 			}
 		}
 		
 		return $recipients;
+	}
+	
+	/**
+	 * ユーザーの通知受信時間帯を取得
+	 */
+	private function get_user_notification_time( $user_id ) {
+		$time_enabled = get_user_meta( $user_id, 'prr_notification_time_enabled', true );
+		
+		if ( $time_enabled !== '1' ) {
+			// 時間帯制限なし
+			return null;
+		}
+		
+		$start_hour = (int) get_user_meta( $user_id, 'prr_notification_start_hour', true );
+		$end_hour = (int) get_user_meta( $user_id, 'prr_notification_end_hour', true );
+		
+		// デフォルト値
+		if ( empty( $start_hour ) && $start_hour !== 0 ) {
+			$start_hour = 9;
+		}
+		if ( empty( $end_hour ) && $end_hour !== 0 ) {
+			$end_hour = 18;
+		}
+		
+		// 分は常に0
+		$start_minute = 0;
+		$end_minute = 0;
+		
+		return array(
+			'start_hour' => $start_hour,
+			'start_minute' => $start_minute,
+			'end_hour' => $end_hour,
+			'end_minute' => $end_minute,
+		);
+	}
+	
+	/**
+	 * 時刻が指定範囲内かチェック
+	 */
+	private function is_time_in_range( $current_minutes, $start_minutes, $end_minutes ) {
+		if ( $start_minutes <= $end_minutes ) {
+			// 通常の範囲（例：9:00-18:00）
+			return $current_minutes >= $start_minutes && $current_minutes <= $end_minutes;
+		} else {
+			// 日をまたぐ範囲（例：22:00-6:00）
+			return $current_minutes >= $start_minutes || $current_minutes <= $end_minutes;
+		}
+	}
+	
+	/**
+	 * 通知をキューに保存
+	 */
+	private function queue_notification( $user_id, $post_id, $subject, $html_message, $headers ) {
+		$queue = get_option( 'prr_notification_queue', array() );
+		
+		$queue[] = array(
+			'user_id' => $user_id,
+			'post_id' => $post_id,
+			'subject' => $subject,
+			'message' => $html_message,
+			'headers' => $headers,
+			'created_at' => current_time( 'mysql' ),
+		);
+		
+		update_option( 'prr_notification_queue', $queue );
+	}
+	
+	/**
+	 * キューに保存された通知を送信
+	 */
+	public function send_queued_notifications() {
+		$queue = get_option( 'prr_notification_queue', array() );
+		
+		if ( empty( $queue ) ) {
+			return;
+		}
+		
+		$current_hour = (int) current_time( 'H' );
+		$current_minute = (int) current_time( 'i' );
+		$current_time_minutes = $current_hour * 60 + $current_minute;
+		
+		$remaining_queue = array();
+		
+		foreach ( $queue as $notification ) {
+			$user_id = $notification['user_id'];
+			$notification_time = $this->get_user_notification_time( $user_id );
+			
+			if ( $notification_time === null ) {
+				// 時間帯制限なしなので送信
+				$user = get_userdata( $user_id );
+				if ( $user && ! empty( $user->user_email ) ) {
+					wp_mail( $user->user_email, $notification['subject'], $notification['message'], $notification['headers'] );
+				}
+			} else {
+				$start_time_minutes = $notification_time['start_hour'] * 60 + $notification_time['start_minute'];
+				$end_time_minutes = $notification_time['end_hour'] * 60 + $notification_time['end_minute'];
+				
+				if ( $this->is_time_in_range( $current_time_minutes, $start_time_minutes, $end_time_minutes ) ) {
+					// 時間帯内なので送信
+					$user = get_userdata( $user_id );
+					if ( $user && ! empty( $user->user_email ) ) {
+						wp_mail( $user->user_email, $notification['subject'], $notification['message'], $notification['headers'] );
+					}
+				} else {
+					// まだ時間帯外なのでキューに残す
+					$remaining_queue[] = $notification;
+				}
+			}
+		}
+		
+		update_option( 'prr_notification_queue', $remaining_queue );
+	}
+	
+	/**
+	 * Cronジョブをスケジュール
+	 */
+	public function schedule_notification_cron() {
+		if ( ! wp_next_scheduled( 'prr_send_queued_notifications' ) ) {
+			wp_schedule_event( time(), 'hourly', 'prr_send_queued_notifications' );
+		}
+	}
+	
+	/**
+	 * Cronジョブを削除
+	 */
+	public function unschedule_notification_cron() {
+		$timestamp = wp_next_scheduled( 'prr_send_queued_notifications' );
+		if ( $timestamp ) {
+			wp_unschedule_event( $timestamp, 'prr_send_queued_notifications' );
+		}
 	}
 	
 	/**
@@ -353,7 +508,10 @@ class Post_Review_Requestor {
 	public function enqueue_admin_assets( $hook ) {
 		// ダッシュボードと管理ページでのみ読み込む
 		if ( 'index.php' !== $hook && strpos( $hook, 'prr-pending-posts' ) === false ) {
-			return;
+			// プロフィールページでも読み込む
+			if ( 'profile.php' !== $hook && 'user-edit.php' !== $hook ) {
+				return;
+			}
 		}
 		
 		wp_enqueue_style(
@@ -362,6 +520,11 @@ class Post_Review_Requestor {
 			array(),
 			PRR_VERSION
 		);
+		
+		// プロフィールページではjQueryを確実に読み込む
+		if ( 'profile.php' === $hook || 'user-edit.php' === $hook ) {
+			wp_enqueue_script( 'jquery' );
+		}
 	}
 	
 	/**
@@ -376,6 +539,20 @@ class Post_Review_Requestor {
 		$receive_notifications = get_user_meta( $user->ID, 'prr_receive_notifications', true );
 		// デフォルトでは有効（既存ユーザーへの後方互換性のため）
 		$checked = ( $receive_notifications === '1' || $receive_notifications === '' ) ? 'checked' : '';
+		
+		$time_enabled = get_user_meta( $user->ID, 'prr_notification_time_enabled', true );
+		$time_checked = $time_enabled === '1' ? 'checked' : '';
+		
+		$start_hour = get_user_meta( $user->ID, 'prr_notification_start_hour', true );
+		$end_hour = get_user_meta( $user->ID, 'prr_notification_end_hour', true );
+		
+		// デフォルト値
+		if ( empty( $start_hour ) && $start_hour !== 0 ) {
+			$start_hour = 9;
+		}
+		if ( empty( $end_hour ) && $end_hour !== 0 ) {
+			$end_hour = 18;
+		}
 		
 		?>
 		<h2>レビュー依頼通知設定</h2>
@@ -398,7 +575,59 @@ class Post_Review_Requestor {
 					</p>
 				</td>
 			</tr>
+			<tr>
+				<th scope="row">通知受信時間帯を設定</th>
+				<td>
+					<label for="prr_notification_time_enabled">
+						<input 
+							type="checkbox" 
+							name="prr_notification_time_enabled" 
+							id="prr_notification_time_enabled" 
+							value="1" 
+							<?php echo esc_attr( $time_checked ); ?>
+						/>
+						指定した時間帯のみ通知を受け取る
+					</label>
+					<p class="description">
+						この設定を有効にすると、指定した時間帯内にのみ通知メールが送信されます。時間帯外の通知は、時間帯内になった時点で送信されます。
+					</p>
+					<div id="prr_notification_time_settings" style="margin-top: 10px; <?php echo $time_checked ? '' : 'display: none;'; ?>">
+						<label>
+							開始時刻:
+							<select name="prr_notification_start_hour" id="prr_notification_start_hour">
+								<?php for ( $i = 0; $i < 24; $i++ ) : ?>
+									<option value="<?php echo esc_attr( $i ); ?>" <?php selected( $start_hour, $i ); ?>>
+										<?php echo esc_html( sprintf( '%02d:00', $i ) ); ?>
+									</option>
+								<?php endfor; ?>
+							</select>
+						</label>
+						～
+						<label>
+							終了時刻:
+							<select name="prr_notification_end_hour" id="prr_notification_end_hour">
+								<?php for ( $i = 0; $i < 24; $i++ ) : ?>
+									<option value="<?php echo esc_attr( $i ); ?>" <?php selected( $end_hour, $i ); ?>>
+										<?php echo esc_html( sprintf( '%02d:00', $i ) ); ?>
+									</option>
+								<?php endfor; ?>
+							</select>
+						</label>
+					</div>
+				</td>
+			</tr>
 		</table>
+		<script>
+		jQuery(document).ready(function($) {
+			$('#prr_notification_time_enabled').on('change', function() {
+				if ($(this).is(':checked')) {
+					$('#prr_notification_time_settings').show();
+				} else {
+					$('#prr_notification_time_settings').hide();
+				}
+			});
+		});
+		</script>
 		<?php
 	}
 	
@@ -423,6 +652,21 @@ class Post_Review_Requestor {
 		} else {
 			update_user_meta( $user_id, 'prr_receive_notifications', '0' );
 		}
+		
+		// 時間帯設定を保存
+		if ( isset( $_POST['prr_notification_time_enabled'] ) && $_POST['prr_notification_time_enabled'] === '1' ) {
+			update_user_meta( $user_id, 'prr_notification_time_enabled', '1' );
+			
+			$start_hour = isset( $_POST['prr_notification_start_hour'] ) ? (int) $_POST['prr_notification_start_hour'] : 9;
+			$end_hour = isset( $_POST['prr_notification_end_hour'] ) ? (int) $_POST['prr_notification_end_hour'] : 18;
+			
+			update_user_meta( $user_id, 'prr_notification_start_hour', $start_hour );
+			update_user_meta( $user_id, 'prr_notification_start_minute', 0 );
+			update_user_meta( $user_id, 'prr_notification_end_hour', $end_hour );
+			update_user_meta( $user_id, 'prr_notification_end_minute', 0 );
+		} else {
+			update_user_meta( $user_id, 'prr_notification_time_enabled', '0' );
+		}
 	}
 }
 
@@ -431,3 +675,20 @@ function prr_init() {
 	Post_Review_Requestor::get_instance();
 }
 add_action( 'plugins_loaded', 'prr_init' );
+
+// プラグイン有効化時にCronを登録
+function prr_activate() {
+	if ( ! wp_next_scheduled( 'prr_send_queued_notifications' ) ) {
+		wp_schedule_event( time(), 'hourly', 'prr_send_queued_notifications' );
+	}
+}
+register_activation_hook( __FILE__, 'prr_activate' );
+
+// プラグイン無効化時にCronを削除
+function prr_deactivate() {
+	$timestamp = wp_next_scheduled( 'prr_send_queued_notifications' );
+	if ( $timestamp ) {
+		wp_unschedule_event( $timestamp, 'prr_send_queued_notifications' );
+	}
+}
+register_deactivation_hook( __FILE__, 'prr_deactivate' );
