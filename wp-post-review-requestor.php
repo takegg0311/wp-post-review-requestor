@@ -5,7 +5,7 @@
  * Plugin Name: Post Review Requestor
  * Plugin URI:  https://github.com/takegg0311/wp-post-review-requestor
  * Description: 投稿・カスタム投稿・固定ページが「レビュー待ち」状態になった場合に通知を行い、ダッシュボード上にレビュー待ち投稿・ページ一覧を表示します。
- * Version:     0.0.1
+ * Version:     0.0.2
  * Author:      takegg0311
  * Author URI:  https://github.com/takegg0311
  * License:     GPLv2 or later
@@ -110,10 +110,27 @@ class Post_Review_Requestor {
 	}
 	
 	/**
+	 * 現在のユーザーがpublish_posts権限を持つかどうかを判定
+	 */
+	private function can_publish_posts() {
+		return current_user_can( 'publish_posts' );
+	}
+	
+	/**
+	 * 指定されたユーザーがpublish_posts権限を持つかどうかを判定
+	 */
+	private function user_can_publish_posts( $user ) {
+		if ( ! $user ) {
+			return false;
+		}
+		return user_can( $user, 'publish_posts' );
+	}
+	
+	/**
 	 * 通知を送信
 	 */
 	private function send_notification( $post ) {
-		// 通知を受け取る設定をしている管理者・編集者を取得
+		// 通知を受け取る設定をしているpublish_posts権限を持つユーザーを取得
 		$recipients = $this->get_notification_recipients();
 		
 		if ( empty( $recipients ) ) {
@@ -192,17 +209,20 @@ class Post_Review_Requestor {
 	}
 	
 	/**
-	 * 通知を受け取る設定をしている管理者・編集者を取得
+	 * 通知を受け取る設定をしているpublish_posts権限を持つユーザーを取得
 	 */
 	private function get_notification_recipients() {
 		$recipients = array();
 		
-		// 管理者・編集者権限を持つユーザーを取得
-		$users = get_users( array(
-			'role__in' => array( 'administrator', 'editor' ),
-		) );
+		// すべてのユーザーを取得
+		$users = get_users();
 		
 		foreach ( $users as $user ) {
+			// publish_posts権限を持つユーザーのみ対象
+			if ( ! user_can( $user, 'publish_posts' ) ) {
+				continue;
+			}
+			
 			// 通知を受け取る設定をしているかチェック
 			$receive_notifications = get_user_meta( $user->ID, 'prr_receive_notifications', true );
 			
@@ -352,8 +372,8 @@ class Post_Review_Requestor {
 	 * ダッシュボードウィジェットを追加
 	 */
 	public function add_dashboard_widget() {
-		// 管理者のみ表示
-		if ( ! current_user_can( 'edit_posts' ) ) {
+		// publish_posts権限を持つユーザーのみ表示
+		if ( ! $this->can_publish_posts() ) {
 			return;
 		}
 		
@@ -368,6 +388,11 @@ class Post_Review_Requestor {
 	 * ダッシュボードウィジェットの内容を表示
 	 */
 	public function render_dashboard_widget() {
+		// publish_posts権限を持つユーザーのみ表示
+		if ( ! $this->can_publish_posts() ) {
+			return;
+		}
+		
 		$pending_posts = $this->get_pending_posts();
 		
 		if ( empty( $pending_posts ) ) {
@@ -411,8 +436,8 @@ class Post_Review_Requestor {
 	 * 管理メニューにページを追加
 	 */
 	public function add_admin_menu() {
-		// 管理者のみ表示
-		if ( ! current_user_can( 'edit_posts' ) ) {
+		// publish_posts権限を持つユーザーのみ表示
+		if ( ! $this->can_publish_posts() ) {
 			return;
 		}
 		
@@ -420,7 +445,7 @@ class Post_Review_Requestor {
 			'edit.php',
 			'レビュー待ち投稿・ページ',
 			'レビュー待ち',
-			'edit_posts',
+			'publish_posts',
 			'prr-pending-posts',
 			array( $this, 'render_admin_page' )
 		);
@@ -430,6 +455,11 @@ class Post_Review_Requestor {
 	 * 管理ページの内容を表示
 	 */
 	public function render_admin_page() {
+		// publish_posts権限を持つユーザーのみ表示
+		if ( ! $this->can_publish_posts() ) {
+			wp_die( 'このページにアクセスする権限がありません。' );
+		}
+		
 		$pending_posts = $this->get_pending_posts();
 		
 		?>
@@ -506,6 +536,11 @@ class Post_Review_Requestor {
 	 * 管理画面のアセットを読み込む
 	 */
 	public function enqueue_admin_assets( $hook ) {
+		// publish_posts権限を持つユーザーのみ読み込む
+		if ( ! $this->can_publish_posts() ) {
+			return;
+		}
+		
 		// ダッシュボードと管理ページでのみ読み込む
 		if ( 'index.php' !== $hook && strpos( $hook, 'prr-pending-posts' ) === false ) {
 			// プロフィールページでも読み込む
@@ -531,8 +566,8 @@ class Post_Review_Requestor {
 	 * ユーザープロフィールページに通知設定を追加
 	 */
 	public function add_user_notification_setting( $user ) {
-		// 管理者・編集者権限を持つユーザーのみ表示
-		if ( ! user_can( $user, 'edit_posts' ) ) {
+		// publish_posts権限を持つユーザーのみ表示
+		if ( ! $this->user_can_publish_posts( $user ) ) {
 			return;
 		}
 		
@@ -640,9 +675,9 @@ class Post_Review_Requestor {
 			return;
 		}
 		
-		// 管理者・編集者権限を持つユーザーのみ保存
+		// publish_posts権限を持つユーザーのみ保存
 		$user = get_userdata( $user_id );
-		if ( ! $user || ! user_can( $user, 'edit_posts' ) ) {
+		if ( ! $user || ! $this->user_can_publish_posts( $user ) ) {
 			return;
 		}
 		
